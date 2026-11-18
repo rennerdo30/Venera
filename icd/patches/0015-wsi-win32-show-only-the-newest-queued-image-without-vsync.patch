@@ -1,0 +1,42 @@
+From: renner.dev
+Subject: wsi/win32: show only the newest queued image without vsync
+
+The DXGI_SHARED present thread presented every queued image in order. With immediate or mailbox present
+modes the application renders faster than the guest compositor takes frames (369 fps against about 250
+flips per second, latency scene, Windows 11 guest), so the queue stayed full and a frame reached the
+screen as many frames late as the swapchain had images: a key press showed on the fourth flip after it,
+16-17 ms median at 240 Hz.
+
+The thread now takes the newest queued image and returns the older ones to the application unshown, as a
+mailbox would; FIFO keeps every frame in order.
+
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -1320,8 +1320,26 @@
+       if (chain->present_head == chain->present_tail)
+          break; /* quit, and nothing left to present */
+ 
+-      const uint32_t index =
++      uint32_t index =
+          chain->present_queue[chain->present_head++ % queue_size];
++      /* Without vsync, only the newest queued image can still be seen: an
++       * older one would be replaced before the next composition. Presenting
++       * each in turn kept the application as many frames behind the display
++       * as it had images (a key showed on the fourth flip after it), so the
++       * older ones go back to the application unshown. Their WSI fences are
++       * waited for when they are presented again (wsi_common_queue_present).
++       */
++      if (chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ||
++          chain->base.present_mode == VK_PRESENT_MODE_MAILBOX_KHR) {
++         bool dropped = false;
++         while (chain->present_head != chain->present_tail) {
++            chain->images[index].state = WSI_IMAGE_IDLE;
++            dropped = true;
++            index = chain->present_queue[chain->present_head++ % queue_size];
++         }
++         if (dropped)
++            u_cnd_monotonic_broadcast(&chain->acquire_cond);
++      }
+       mtx_unlock(&chain->acquire_mutex);
+       /* Marks the image idle (and records a failure in chain->status). */
+       wsi_win32_present_dxgi_shared_now(chain, &chain->images[index], index,
