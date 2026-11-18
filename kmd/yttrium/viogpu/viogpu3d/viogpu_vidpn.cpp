@@ -62,6 +62,13 @@ VioGpuVidPN::~VioGpuVidPN()
     m_ModeInfo = NULL;
     m_ModeNumbers = NULL;
 
+    /* Release the timer resolution held since the first vblank timer (StartVsyncTimer). */
+    if (m_timerRes)
+    {
+        ExSetTimerResolution(m_timerRes, FALSE);
+        m_timerRes = 0;
+    }
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
 
@@ -2029,9 +2036,14 @@ VOID VioGpuVidPN::StartVsyncTimer(void)
 {
     ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
+    /* The finest system timer resolution (0.5 ms), held from the first vblank timer on for as
+     * long as the driver runs, not only while vblank interrupts are on: Windows applies a
+     * driver's request system-wide, and without it every timed wait in the guest (sleeps,
+     * timeouts, the Venus ICD's waits) falls back to the default 15.6 ms tick whenever DWM turns
+     * vblank off, which showed as frame stalls in steps of 15.6 ms. */
     if (!m_timerRes)
     {
-        m_timerRes = ExSetTimerResolution(10000, TRUE);
+        m_timerRes = ExSetTimerResolution(5000, TRUE);
     }
 
     LARGE_INTEGER now;
@@ -2059,11 +2071,7 @@ VOID VioGpuVidPN::StopVsyncTimer(void)
 
     KeFlushQueuedDpcs();
 
-    if (m_timerRes)
-    {
-        ExSetTimerResolution(m_timerRes, FALSE);
-        m_timerRes = 0;
-    }
+    /* The timer resolution stays requested (see StartVsyncTimer). */
 }
 
 void VioGpuVidPN::Flip()
