@@ -164,9 +164,15 @@ class VioGpuVidPN
     PHYSICAL_ADDRESS m_sourceAddress = {0};
     VioGpuAllocation *m_sourceRes = NULL;
     volatile LONG m_shouldFlip = 0;
-    /* An immediate flip (FlipImmediate) is shown from this DPC, without waiting for vblank. */
-    KDPC m_immediateFlipDpc;
-    static void ImmediateFlipDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2);
+    /* Every flip is shown and reported from this DPC right away (see FlipDpc). */
+    KDPC m_flipDpc;
+    static void FlipDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2);
+    /* The pending flip asked for FlipImmediate (shown even inside the minimum vblank interval). */
+    volatile LONG m_immediatePending = 0;
+    /* When the last vblank was reported (system time, 100 ns); under m_vsyncTimerLock. */
+    LONGLONG m_lastVblank = 0;
+    /* Reports a vblank now unless the last one was less than a period ago; re-arms the idle tick. */
+    void VblankIfDue(bool fromFlip);
 
 
     volatile LONG m_shouldFlipStop = 1;

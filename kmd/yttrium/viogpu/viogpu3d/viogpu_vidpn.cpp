@@ -41,7 +41,7 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
     KeInitializeSpinLock(&m_vsyncTimerLock);
     KeInitializeTimerEx(&m_vsyncNotifyTimer, SynchronizationTimer);
     KeInitializeDpc(&m_vsyncNotifyDpc, VioGpuVidPN::VsyncNotifyTimerDpc, this);
-    KeInitializeDpc(&m_immediateFlipDpc, VioGpuVidPN::ImmediateFlipDpc, this);
+    KeInitializeDpc(&m_flipDpc, VioGpuVidPN::FlipDpc, this);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -2062,6 +2062,45 @@ void VioGpuVidPN::Flip()
     }
 }
 
+/* Vblank follows the flips: a flip is reported as soon as it is shown, so whoever waits for it
+ * (an app presenting with vsync, DWM's next composition) goes on at once instead of at the next
+ * fixed tick. Two vblanks are at least kVsyncPeriod100ns apart (the highest refresh rate); with
+ * no flips the timer ticks at that period, so DWM's clock keeps running while it composes. A
+ * vblank is reported with the address on screen, after the flip it releases has been shown,
+ * as a display's vblank interrupt would (reported out of step, DWM alternated 60 and 30 fps). */
+void VioGpuVidPN::VblankIfDue(bool fromFlip)
+{
+    LARGE_INTEGER now;
+    KeQuerySystemTime(&now);
+
+    KeAcquireSpinLockAtDpcLevel(&m_vsyncTimerLock);
+    const bool stopped = InterlockedCompareExchange(&m_shouldFlipStop, 0, 0) != 0;
+    const bool due = !stopped && now.QuadPart - m_lastVblank >= kVsyncPeriod100ns;
+    if (due)
+    {
+        m_lastVblank = now.QuadPart;
+        /* The idle tick: one period after this vblank (replaces the pending one). */
+        LARGE_INTEGER next;
+        next.QuadPart = -kVsyncPeriod100ns;
+        KeSetTimerEx(&m_vsyncNotifyTimer, next, 0, &m_vsyncNotifyDpc);
+    }
+    else if (!stopped && !fromFlip)
+    {
+        /* A flip reported a vblank since this tick was set: tick one period after that one. */
+        LARGE_INTEGER next;
+        next.QuadPart = -(m_lastVblank + kVsyncPeriod100ns - now.QuadPart);
+        KeSetTimerEx(&m_vsyncNotifyTimer, next, 0, &m_vsyncNotifyDpc);
+    }
+    KeReleaseSpinLockFromDpcLevel(&m_vsyncTimerLock);
+
+    if (due)
+    {
+        Flip();
+        m_pAdapter->NotifyVsync(m_sourceAddress);
+    }
+    /* Too soon after the last vblank: the idle tick, due within one period, reports this flip. */
+}
+
 void VioGpuVidPN::VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2)
 {
     UNREFERENCED_PARAMETER(dpc);
@@ -2069,50 +2108,11 @@ void VioGpuVidPN::VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID sy
     UNREFERENCED_PARAMETER(systemArg2);
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(deferredContext);
-    if (!vidpn || InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) != 0)
+    if (vidpn)
     {
-        return;
+        vidpn->VblankIfDue(false);
     }
-
-    LARGE_INTEGER now;
-    LARGE_INTEGER next;
-    KeQuerySystemTime(&now);
-
-    next.QuadPart = vidpn->next_vsync_time.QuadPart + kVsyncPeriod100ns;
-    if (next.QuadPart < now.QuadPart)
-    {
-        next.QuadPart = now.QuadPart + kVsyncPeriod100ns;
-    }
-    else if (next.QuadPart > (now.QuadPart + kVsyncMaxLead100ns))
-    {
-        next.QuadPart = now.QuadPart + kVsyncPeriod100ns;
-    }
-    vidpn->next_vsync_time = next;
-
-    LARGE_INTEGER due;
-    due.QuadPart = next.QuadPart - now.QuadPart;
-    if (due.QuadPart <= 0 || due.QuadPart > kVsyncMaxLead100ns)
-    {
-        due.QuadPart = kVsyncPeriod100ns;
-    }
-    due.QuadPart = -due.QuadPart;
-
-    vidpn->Flip();
-    /* Report the vblank now, with the address on screen, as a display's vblank
-     * interrupt would. Raising it from the next host completion instead (a NOP
-     * round trip) made it land before or after the flip that this vblank
-     * released completes, depending on host timing, so that flip was reported
-     * on this vblank or only on the next, and DWM alternated 60 and 30 fps. */
-    vidpn->m_pAdapter->NotifyVsync(vidpn->m_sourceAddress);
-
-    KeAcquireSpinLockAtDpcLevel(&vidpn->m_vsyncTimerLock);
-    if (InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) == 0)
-    {
-        KeSetTimerEx(&vidpn->m_vsyncNotifyTimer, due, 0, &vidpn->m_vsyncNotifyDpc);
-    }
-    KeReleaseSpinLockFromDpcLevel(&vidpn->m_vsyncTimerLock);
 }
-
 
 NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
 {
@@ -2135,27 +2135,33 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
               m_sourceAddress.QuadPart,
               m_sourceRes));
     InterlockedOr(&m_shouldFlip, 1);
-    /* An immediate flip shows now (from a DPC: this may run at raised IRQL), not at the next
-     * vblank; the vblank that follows reports the address as usual. */
     if (pSetVidPnSourceAddress->Flags.FlipImmediate)
     {
-        KeInsertQueueDpc(&m_immediateFlipDpc, NULL, NULL);
+        InterlockedOr(&m_immediatePending, 1);
     }
+    /* Shown and reported from a DPC (this may run at raised IRQL), not at a fixed tick. */
+    KeInsertQueueDpc(&m_flipDpc, NULL, NULL);
 
     return STATUS_SUCCESS;
 };
 
-void VioGpuVidPN::ImmediateFlipDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2)
+void VioGpuVidPN::FlipDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2)
 {
     UNREFERENCED_PARAMETER(dpc);
     UNREFERENCED_PARAMETER(systemArg1);
     UNREFERENCED_PARAMETER(systemArg2);
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(deferredContext);
-    if (vidpn && InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) == 0)
+    if (!vidpn || InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) != 0)
+    {
+        return;
+    }
+    /* An immediate flip is shown now even inside the minimum interval (tearing is allowed). */
+    if (InterlockedExchange(&vidpn->m_immediatePending, 0))
     {
         vidpn->Flip();
     }
+    vidpn->VblankIfDue(true);
 }
 
 D3DDDI_VIDEO_PRESENT_SOURCE_ID VioGpuVidPN::FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
