@@ -1025,8 +1025,8 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
     pDescribeAllocation->MultisampleMethod.NumQualityLevels = 0;
     pDescribeAllocation->MultisampleMethod.NumSamples = max(m_options.nr_samples, 1u);
 
-    // The only refresh rate we report (VIOGPU_REFRESH_HZ).
-    pDescribeAllocation->RefreshRate.Numerator = VIOGPU_REFRESH_HZ;
+    // The only refresh rate we report (the display's, VioGpuVidPN::RefreshHz).
+    pDescribeAllocation->RefreshRate.Numerator = m_adapter->vidpn.RefreshHz();
     pDescribeAllocation->RefreshRate.Denominator = 1;
 
     return STATUS_SUCCESS;

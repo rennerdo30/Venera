@@ -16,8 +16,7 @@
  * paces presents per vblank, so it bounds how soon a frame can show: 240 Hz waits at most
  * about 4 ms for the next vblank where 60 Hz waited up to 17 (two vblanks, 33, with the flip
  * queue). The host shows frames as they complete, so no host display limits this rate. */
-static const LONGLONG kVsyncPeriod100ns = 10000000LL / VIOGPU_REFRESH_HZ;
-static const LONGLONG kVsyncMaxLead100ns = 2 * kVsyncPeriod100ns;
+
 
 PAGED_CODE_SEG_BEGIN
 
@@ -978,11 +977,11 @@ VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalIn
 
 #if 1
     /* 1080p's 2200 x 1125 total timing at the reported refresh rate. */
-    pVideoSignalInfo->VSyncFreq.Numerator = VIOGPU_REFRESH_HZ;
+    pVideoSignalInfo->VSyncFreq.Numerator = m_refreshHz;
     pVideoSignalInfo->VSyncFreq.Denominator = 1;
-    pVideoSignalInfo->HSyncFreq.Numerator = VIOGPU_REFRESH_HZ * 1125;
+    pVideoSignalInfo->HSyncFreq.Numerator = m_refreshHz * 1125;
     pVideoSignalInfo->HSyncFreq.Denominator = 1;
-    pVideoSignalInfo->PixelRate = (UINT64)VIOGPU_REFRESH_HZ * 2200 * 1125;
+    pVideoSignalInfo->PixelRate = (UINT64)m_refreshHz * 2200 * 1125;
 #else
 
     pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
@@ -1701,12 +1700,40 @@ int VioGpuVidPN::ProcessEdid(void)
     if (virtio_is_feature_enabled(m_pAdapter->m_u64HostFeatures, VIRTIO_GPU_F_EDID))
     {
         GetEdids();
+        UpdateRefreshFromEdid();
     }
     else
     {
         FixEdid();
     }
     return AddEdidModes();
+}
+
+/* The refresh rate of the EDID's preferred timing (the first detailed timing descriptor) when
+ * it is higher than VIOGPU_REFRESH_HZ: the host gives the guest its monitor's rate there. */
+void VioGpuVidPN::UpdateRefreshFromEdid(void)
+{
+    PAGED_CODE();
+
+    if (!m_bEDID)
+    {
+        return;
+    }
+    const UCHAR *d = m_EDIDs[0] + 54;
+    const ULONG clock10khz = d[0] | (d[1] << 8);
+    const ULONG htotal = (d[2] | ((d[4] & 0xF0) << 4)) + (d[3] | ((d[4] & 0x0F) << 8));
+    const ULONG vtotal = (d[5] | ((d[7] & 0xF0) << 4)) + (d[6] | ((d[7] & 0x0F) << 8));
+    if (clock10khz == 0 || htotal == 0 || vtotal == 0)
+    {
+        return;
+    }
+    const ULONG hz = (ULONG)(((ULONGLONG)clock10khz * 10000 + htotal * vtotal / 2) / ((ULONGLONG)htotal * vtotal));
+    if (hz > m_refreshHz && hz <= VIOGPU_REFRESH_HZ_MAX)
+    {
+        m_refreshHz = hz;
+        m_period100ns = 10000000LL / hz;
+    }
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("%s edid=%u Hz, using %u Hz\n", __FUNCTION__, hz, m_refreshHz));
 }
 
 BOOLEAN VioGpuVidPN::UpdateModes(USHORT xres, USHORT yres, int &cnt)
@@ -2010,8 +2037,8 @@ VOID VioGpuVidPN::StartVsyncTimer(void)
     LARGE_INTEGER now;
     LARGE_INTEGER due;
     KeQuerySystemTime(&now);
-    next_vsync_time.QuadPart = now.QuadPart + kVsyncPeriod100ns;
-    due.QuadPart = -kVsyncPeriod100ns;
+    next_vsync_time.QuadPart = now.QuadPart + m_period100ns;
+    due.QuadPart = -m_period100ns;
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&m_vsyncTimerLock, &oldIrql);
@@ -2064,7 +2091,7 @@ void VioGpuVidPN::Flip()
 
 /* Vblank follows the flips: a flip is reported as soon as it is shown, so whoever waits for it
  * (an app presenting with vsync, DWM's next composition) goes on at once instead of at the next
- * fixed tick. Two vblanks are at least kVsyncPeriod100ns apart (the highest refresh rate); with
+ * fixed tick. Two vblanks are at least m_period100ns apart (the highest refresh rate); with
  * no flips the timer ticks at that period, so DWM's clock keeps running while it composes. A
  * vblank is reported with the address on screen, after the flip it releases has been shown,
  * as a display's vblank interrupt would (reported out of step, DWM alternated 60 and 30 fps). */
@@ -2075,20 +2102,20 @@ void VioGpuVidPN::VblankIfDue(bool fromFlip)
 
     KeAcquireSpinLockAtDpcLevel(&m_vsyncTimerLock);
     const bool stopped = InterlockedCompareExchange(&m_shouldFlipStop, 0, 0) != 0;
-    const bool due = !stopped && now.QuadPart - m_lastVblank >= kVsyncPeriod100ns;
+    const bool due = !stopped && now.QuadPart - m_lastVblank >= m_period100ns;
     if (due)
     {
         m_lastVblank = now.QuadPart;
         /* The idle tick: one period after this vblank (replaces the pending one). */
         LARGE_INTEGER next;
-        next.QuadPart = -kVsyncPeriod100ns;
+        next.QuadPart = -m_period100ns;
         KeSetTimerEx(&m_vsyncNotifyTimer, next, 0, &m_vsyncNotifyDpc);
     }
     else if (!stopped && !fromFlip)
     {
         /* A flip reported a vblank since this tick was set: tick one period after that one. */
         LARGE_INTEGER next;
-        next.QuadPart = -(m_lastVblank + kVsyncPeriod100ns - now.QuadPart);
+        next.QuadPart = -(m_lastVblank + m_period100ns - now.QuadPart);
         KeSetTimerEx(&m_vsyncNotifyTimer, next, 0, &m_vsyncNotifyDpc);
     }
     KeReleaseSpinLockFromDpcLevel(&m_vsyncTimerLock);

@@ -6,10 +6,14 @@
 
 #pragma once
 
-/* The display's refresh rate (Hz): the vblank timer and every rate the driver reports. */
+/* The lowest refresh rate (Hz) the display reports and its vblank timer runs at. A host
+ * monitor with a higher rate raises it (from the EDID's preferred timing, see
+ * UpdateRefreshFromEdid); never lower: the vblank paces the guest's compositor, and the host
+ * shows the newest frame at its own refresh anyway. */
 #ifndef VIOGPU_REFRESH_HZ
 #define VIOGPU_REFRESH_HZ 240
 #endif
+#define VIOGPU_REFRESH_HZ_MAX 1000
 
 #include "helper.h"
 #include "viogpu.h"
@@ -88,6 +92,11 @@ class VioGpuVidPN
     void SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
     BOOLEAN GetDisplayInfo(void);
     int ProcessEdid(void);
+    /* The refresh rate in use (Hz): reported in every mode and the vblank timer's rate. */
+    ULONG RefreshHz(void) const
+    {
+        return m_refreshHz;
+    }
     void FixEdid(void);
     BOOLEAN GetEdids(void);
     int AddEdidModes(void);
@@ -130,6 +139,10 @@ class VioGpuVidPN
     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
 
   private:
+    void UpdateRefreshFromEdid(void);
+    ULONG m_refreshHz = VIOGPU_REFRESH_HZ;
+    /* One vblank period at m_refreshHz (100 ns units). */
+    LONGLONG m_period100ns = 10000000LL / VIOGPU_REFRESH_HZ;
     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
                                   CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath);
     NTSTATUS AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pRecommendMonitorModes);
