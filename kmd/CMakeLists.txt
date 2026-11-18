@@ -86,9 +86,15 @@ target_link_libraries(viogpu3d PRIVATE
 
 # Test-signed copy, the file the guest loads.
 find_program(OSSLSIGNCODE osslsigncode REQUIRED)
+# The signing step's output goes nowhere: /dev/null, or NUL when the build runs on Windows.
+if(CMAKE_HOST_WIN32)
+  set(devnull NUL)
+else()
+  set(devnull /dev/null)
+endif()
 add_custom_command(TARGET viogpu3d POST_BUILD
     COMMAND "${OSSLSIGNCODE}" sign -pkcs12 "${VENERA_KMD_SIGN_PFX}" -pass "" -h sha256
-            -in "$<TARGET_FILE:viogpu3d>" -out "${CMAKE_BINARY_DIR}/signed/viogpu3d.sys.tmp" > /dev/null
+            -in "$<TARGET_FILE:viogpu3d>" -out "${CMAKE_BINARY_DIR}/signed/viogpu3d.sys.tmp" > ${devnull}
     COMMAND "${CMAKE_COMMAND}" -E rename "${CMAKE_BINARY_DIR}/signed/viogpu3d.sys.tmp" "${CMAKE_BINARY_DIR}/signed/viogpu3d.sys"
     COMMENT "Test-signing viogpu3d.sys"
     VERBATIM)
