@@ -12,8 +12,12 @@
 #include "edid.h"
 #include "trace.h"
 
-static const LONGLONG kVsyncPeriod100ns = 166666LL; // 60 Hz
-static const LONGLONG kVsyncMaxLead100ns = 333333LL;
+/* The refresh rate the display reports and the vblank timer runs at. The desktop composes and
+ * paces presents per vblank, so it bounds how soon a frame can show: 240 Hz waits at most
+ * about 4 ms for the next vblank where 60 Hz waited up to 17 (two vblanks, 33, with the flip
+ * queue). The host shows frames as they complete, so no host display limits this rate. */
+static const LONGLONG kVsyncPeriod100ns = 10000000LL / VIOGPU_REFRESH_HZ;
+static const LONGLONG kVsyncMaxLead100ns = 2 * kVsyncPeriod100ns;
 
 PAGED_CODE_SEG_BEGIN
 
@@ -37,6 +41,7 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
     KeInitializeSpinLock(&m_vsyncTimerLock);
     KeInitializeTimerEx(&m_vsyncNotifyTimer, SynchronizationTimer);
     KeInitializeDpc(&m_vsyncNotifyDpc, VioGpuVidPN::VsyncNotifyTimerDpc, this);
+    KeInitializeDpc(&m_immediateFlipDpc, VioGpuVidPN::ImmediateFlipDpc, this);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -972,11 +977,12 @@ VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalIn
     pVideoSignalInfo->ActiveSize = pVideoSignalInfo->TotalSize;
 
 #if 1
-    pVideoSignalInfo->VSyncFreq.Numerator = 148500000;
-    pVideoSignalInfo->VSyncFreq.Denominator = 2475000;
-    pVideoSignalInfo->HSyncFreq.Numerator = 67500;
+    /* 1080p's 2200 x 1125 total timing at the reported refresh rate. */
+    pVideoSignalInfo->VSyncFreq.Numerator = VIOGPU_REFRESH_HZ;
+    pVideoSignalInfo->VSyncFreq.Denominator = 1;
+    pVideoSignalInfo->HSyncFreq.Numerator = VIOGPU_REFRESH_HZ * 1125;
     pVideoSignalInfo->HSyncFreq.Denominator = 1;
-    pVideoSignalInfo->PixelRate = 148500000;
+    pVideoSignalInfo->PixelRate = (UINT64)VIOGPU_REFRESH_HZ * 2200 * 1125;
 #else
 
     pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
@@ -2129,9 +2135,28 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
               m_sourceAddress.QuadPart,
               m_sourceRes));
     InterlockedOr(&m_shouldFlip, 1);
+    /* An immediate flip shows now (from a DPC: this may run at raised IRQL), not at the next
+     * vblank; the vblank that follows reports the address as usual. */
+    if (pSetVidPnSourceAddress->Flags.FlipImmediate)
+    {
+        KeInsertQueueDpc(&m_immediateFlipDpc, NULL, NULL);
+    }
 
     return STATUS_SUCCESS;
 };
+
+void VioGpuVidPN::ImmediateFlipDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2)
+{
+    UNREFERENCED_PARAMETER(dpc);
+    UNREFERENCED_PARAMETER(systemArg1);
+    UNREFERENCED_PARAMETER(systemArg2);
+
+    VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(deferredContext);
+    if (vidpn && InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) == 0)
+    {
+        vidpn->Flip();
+    }
+}
 
 D3DDDI_VIDEO_PRESENT_SOURCE_ID VioGpuVidPN::FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
                                                                 BOOLEAN DefaultToZero)

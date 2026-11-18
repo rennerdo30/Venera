@@ -6,6 +6,11 @@
 
 #pragma once
 
+/* The display's refresh rate (Hz): the vblank timer and every rate the driver reports. */
+#ifndef VIOGPU_REFRESH_HZ
+#define VIOGPU_REFRESH_HZ 240
+#endif
+
 #include "helper.h"
 #include "viogpu.h"
 
@@ -159,6 +164,9 @@ class VioGpuVidPN
     PHYSICAL_ADDRESS m_sourceAddress = {0};
     VioGpuAllocation *m_sourceRes = NULL;
     volatile LONG m_shouldFlip = 0;
+    /* An immediate flip (FlipImmediate) is shown from this DPC, without waiting for vblank. */
+    KDPC m_immediateFlipDpc;
+    static void ImmediateFlipDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2);
 
 
     volatile LONG m_shouldFlipStop = 1;

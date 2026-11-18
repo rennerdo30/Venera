@@ -797,6 +797,9 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 pDriverCaps->PresentationCaps.MaxTextureHeightShift = 1;
 
                 pDriverCaps->FlipCaps.FlipOnVSyncMmIo = TRUE;
+                /* Immediate flips (tearing allowed, e.g. a game presenting without vsync): shown
+                 * as soon as they are requested instead of on the next vblank. */
+                pDriverCaps->FlipCaps.FlipImmediateMmIo = TRUE;
 
                 pDriverCaps->MaxQueuedFlipOnVSync = 1;
 
